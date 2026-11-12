@@ -61,12 +61,18 @@ if [ -f "$SETTINGS" ]; then
       if(!raw.trim())process.exit(0);
       let s;try{s=JSON.parse(raw);}catch(e){console.error("    Could not parse settings.json — leaving it alone.");process.exit(0);}
       if(!s||typeof s!=="object"||typeof s.hooks!=="object"||s.hooks===null)process.exit(0);
-      const isOurs=g=>g&&Array.isArray(g.hooks)&&g.hooks.some(h=>h&&typeof h.command==="string"&&h.command.includes(marker));
+      // Strip OUR hook entries, not whole groups (a group may hold other hooks).
+      const isOurHook=h=>h&&typeof h.command==="string"&&h.command.includes(marker);
+      const strip=arr=>arr.flatMap(g=>{
+        if(!g||!Array.isArray(g.hooks)||!g.hooks.some(isOurHook)) return [g];
+        const rest=g.hooks.filter(h=>!isOurHook(h));
+        return rest.length?[Object.assign({},g,{hooks:rest})]:[];
+      });
       let changed=false;
-      for(const ev of ["Stop","Notification","PreToolUse","PostToolUse"]){
+      for(const ev of ["Stop","Notification","PermissionRequest","PreToolUse","PostToolUse"]){
         if(Array.isArray(s.hooks[ev])){
-          const kept=s.hooks[ev].filter(g=>!isOurs(g));
-          if(kept.length!==s.hooks[ev].length)changed=true;
+          const kept=strip(s.hooks[ev]);
+          if(JSON.stringify(kept)!==JSON.stringify(s.hooks[ev]))changed=true;
           if(kept.length>0)s.hooks[ev]=kept; else delete s.hooks[ev];
         }
       }
@@ -86,13 +92,23 @@ try: s=json.loads(raw)
 except Exception:
     print("    Could not parse settings.json — leaving it alone."); sys.exit(0)
 if not isinstance(s,dict) or not isinstance(s.get("hooks"),dict): sys.exit(0)
-def is_ours(g):
-    return isinstance(g,dict) and isinstance(g.get("hooks"),list) and any(isinstance(h,dict) and isinstance(h.get("command"),str) and marker in h["command"] for h in g["hooks"])
+# Strip OUR hook entries, not whole groups: a group may also hold someone
+# other hook (e.g. another Stop command), and that one must survive.
+def is_our_hook(h):
+    return isinstance(h,dict) and isinstance(h.get("command"),str) and marker in h["command"]
+def strip(arr):
+    out=[]
+    for g in arr:
+        if isinstance(g,dict) and isinstance(g.get("hooks"),list) and any(is_our_hook(h) for h in g["hooks"]):
+            rest=[h for h in g["hooks"] if not is_our_hook(h)]
+            if rest: out.append(dict(g,hooks=rest))
+        else: out.append(g)
+    return out
 changed=False
-for ev in ["Stop","Notification","PreToolUse","PostToolUse"]:
+for ev in ["Stop","Notification","PermissionRequest","PreToolUse","PostToolUse"]:
     if isinstance(s["hooks"].get(ev),list):
-        kept=[g for g in s["hooks"][ev] if not is_ours(g)]
-        if len(kept)!=len(s["hooks"][ev]): changed=True
+        kept=strip(s["hooks"][ev])
+        if kept!=s["hooks"][ev]: changed=True
         if kept: s["hooks"][ev]=kept
         else: del s["hooks"][ev]
 if not s["hooks"]: del s["hooks"]

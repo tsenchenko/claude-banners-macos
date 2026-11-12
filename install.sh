@@ -2,7 +2,7 @@
 #
 # Installs Claude Code notifications for macOS.
 #
-# Sets up Claude Code hooks (Stop, Notification, PreToolUse, PostToolUse) to fire native
+# Sets up Claude Code hooks (Stop, Notification, PermissionRequest, PreToolUse) to fire native
 # macOS notifications via terminal-notifier. Installs terminal-notifier (Homebrew
 # if available, otherwise a per-user download — no admin), copies the hook
 # scripts to ~/.claude/hooks/, and merges the hooks block into
@@ -105,9 +105,10 @@ for f in notify.sh focus-vscode.sh; do
 done
 
 # --- 3. merge hooks into settings.json -------------------------------------
-# Surgical merge: only our four events (Stop, Notification, PreToolUse,
-# PostToolUse) are touched, and within each event only OUR entry (identified by
-# the notify.sh command) is replaced. Any other hooks — SessionStart, a user's
+# Surgical merge: only our events (Stop, Notification, PermissionRequest,
+# PreToolUse) are touched, and within each event only OUR entry (identified by
+# the notify.sh command) is replaced. Our PostToolUse entry from older versions
+# (the removed "waiting detector") is dropped. Any other hooks — SessionStart, a user's
 # own Stop hook, unrelated matchers — are preserved. Idempotent: re-running drops
 # our previous entry before re-adding, so it never duplicates. The marker
 # "/.claude/hooks/notify.sh" also matches older absolute-path installs, so
@@ -124,16 +125,29 @@ if [ "$JSON_RT" = "node" ]; then
     catch(e){if(e.code!=="ENOENT"){console.error("settings.json is not valid JSON. Fix it and re-run.");process.exit(3);}}
     if(typeof settings!=="object"||settings===null||Array.isArray(settings)){console.error("settings.json is not a JSON object.");process.exit(3);}
     if(typeof settings.hooks!=="object"||settings.hooks===null||Array.isArray(settings.hooks)) settings.hooks={};
-    const isOurs=g=>g&&Array.isArray(g.hooks)&&g.hooks.some(h=>h&&typeof h.command==="string"&&h.command.includes(marker));
+    // Strip OUR hook entries, not whole groups: a group may also hold someone
+    // other hook (e.g. another Stop command), and that one must survive.
+    const isOurHook=h=>h&&typeof h.command==="string"&&h.command.includes(marker);
+    const strip=arr=>arr.flatMap(g=>{
+      if(!g||!Array.isArray(g.hooks)||!g.hooks.some(isOurHook)) return [g];
+      const rest=g.hooks.filter(h=>!isOurHook(h));
+      return rest.length?[Object.assign({},g,{hooks:rest})]:[];
+    });
     const upsert=(event,matcher,arg)=>{
-      const arr=Array.isArray(settings.hooks[event])?settings.hooks[event].filter(g=>!isOurs(g)):[];
+      const arr=Array.isArray(settings.hooks[event])?strip(settings.hooks[event]):[];
       arr.push({matcher:matcher,hooks:[{type:"command",command:notify+" "+arg}]});
       settings.hooks[event]=arr;
     };
+    const drop=event=>{
+      if(!Array.isArray(settings.hooks[event])) return;
+      const arr=strip(settings.hooks[event]);
+      if(arr.length) settings.hooks[event]=arr; else delete settings.hooks[event];
+    };
     upsert("Stop","","Stop");
     upsert("Notification","","Notification");
-    upsert("PreToolUse","Read|Edit|Write|MultiEdit|NotebookEdit|AskUserQuestion|ExitPlanMode","PreToolUse");
-    upsert("PostToolUse","Read|Edit|Write|MultiEdit|NotebookEdit","PostToolUse");
+    upsert("PermissionRequest","","PermissionRequest");
+    upsert("PreToolUse","AskUserQuestion|ExitPlanMode","PreToolUse");
+    drop("PostToolUse");   // older versions hooked every Read/Edit/Write here
     fs.mkdirSync(path.dirname(file),{recursive:true});
     fs.writeFileSync(file,JSON.stringify(settings,null,2)+"\n");
   '
@@ -155,16 +169,32 @@ if not isinstance(settings,dict):
     sys.stderr.write("settings.json is not a JSON object.\n"); sys.exit(3)
 hooks=settings.get("hooks")
 if not isinstance(hooks,dict): hooks={}
-def is_ours(g):
-    return isinstance(g,dict) and isinstance(g.get("hooks"),list) and any(isinstance(h,dict) and isinstance(h.get("command"),str) and marker in h["command"] for h in g["hooks"])
+# Strip OUR hook entries, not whole groups: a group may also hold someone
+# other hook (e.g. another Stop command), and that one must survive.
+def is_our_hook(h):
+    return isinstance(h,dict) and isinstance(h.get("command"),str) and marker in h["command"]
+def strip(arr):
+    out=[]
+    for g in arr:
+        if isinstance(g,dict) and isinstance(g.get("hooks"),list) and any(is_our_hook(h) for h in g["hooks"]):
+            rest=[h for h in g["hooks"] if not is_our_hook(h)]
+            if rest: out.append(dict(g,hooks=rest))
+        else: out.append(g)
+    return out
 def upsert(event,matcher,arg):
-    arr=[g for g in hooks.get(event,[]) if not is_ours(g)] if isinstance(hooks.get(event),list) else []
+    arr=strip(hooks[event]) if isinstance(hooks.get(event),list) else []
     arr.append({"matcher":matcher,"hooks":[{"type":"command","command":notify+" "+arg}]})
     hooks[event]=arr
+def drop(event):
+    if not isinstance(hooks.get(event),list): return
+    arr=strip(hooks[event])
+    if arr: hooks[event]=arr
+    else: hooks.pop(event,None)
 upsert("Stop","","Stop")
 upsert("Notification","","Notification")
-upsert("PreToolUse","Read|Edit|Write|MultiEdit|NotebookEdit|AskUserQuestion|ExitPlanMode","PreToolUse")
-upsert("PostToolUse","Read|Edit|Write|MultiEdit|NotebookEdit","PostToolUse")
+upsert("PermissionRequest","","PermissionRequest")
+upsert("PreToolUse","AskUserQuestion|ExitPlanMode","PreToolUse")
+drop("PostToolUse")   # older versions hooked every Read/Edit/Write here
 settings["hooks"]=hooks
 os.makedirs(os.path.dirname(f),exist_ok=True)
 with open(f,"w",encoding="utf-8") as fh:
