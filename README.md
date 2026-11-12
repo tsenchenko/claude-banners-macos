@@ -17,16 +17,16 @@ Switch to another app while Claude is running and you won't know when it:
 
 ## The solution
 
-This repo wires Claude Code's built-in **hooks** (`Stop`, `Notification`, and `PreToolUse`) into native macOS notifications. You get a banner in the corner of the screen the moment Claude returns control to you. The notification even shows the actual question text, so you know what's pending without switching apps.
+This repo wires Claude Code's built-in **hooks** (`Stop`, `Notification`, `PermissionRequest`, and `PreToolUse`) into native macOS notifications. You get a banner in the corner of the screen the moment Claude returns control to you. The notification even shows the actual question text, so you know what's pending without switching apps.
 
 **Click the notification** to bring the right VS Code window forward — matched by project folder, even if you have several VS Code windows open.
 
 ## Features
 
 - Notification on `Stop` (Claude finishes its turn)
-- Notification on `Notification` (permission prompts, idle prompts), showing the actual prompt text
+- Notification on `Notification` (idle prompts), showing the actual prompt text. Its `permission_prompt` type is skipped — it only repeats a prompt already shown, 15–30 s later
 - Notification on `PreToolUse` for `AskUserQuestion` and `ExitPlanMode` — in-chat questions and plan-mode approval, which Claude Code does **not** dispatch through the `Notification` event
-- **Tool-permission prompts** ("Allow reading from X?", "Allow running …?") — the VS Code extension fires no hook for these, so a small detector spots when a tool (Read/Edit/Write) is left blocked waiting for your approval and raises a banner
+- **Tool-permission prompts** ("Allow reading from X?", "Allow running …?") via the dedicated `PermissionRequest` event, showing the tool and what it wants to run
 - The question text is surfaced in the notification body, so you know what's being asked without switching apps
 - **Click** the notification to focus the correct VS Code window — even with multiple windows open, it picks the one running this Claude Code session (via the `code` CLI, so no Accessibility permission is needed)
 - **Focus-aware suppression** — no banner while you're already looking at that project's VS Code window (matched per-window, so a banner from *another* project still comes through). Best-effort: if Accessibility isn't granted it fails open and the banner simply shows
@@ -55,10 +55,12 @@ The installer will:
 
 1. Install [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) — via Homebrew if you have it, otherwise a per-user copy into `~/.claude/bin/` (no admin)
 2. Copy `notify.sh` and `focus-vscode.sh` to `~/.claude/hooks/`
-3. Merge `Stop`, `Notification`, `PreToolUse`, and `PostToolUse` hooks into `~/.claude/settings.json`, using portable `"$HOME/..."` commands (other keys and other hooks are preserved)
+3. Merge `Stop`, `Notification`, `PermissionRequest`, and `PreToolUse` hooks into `~/.claude/settings.json`, using portable `"$HOME/..."` commands (other keys and other hooks are preserved — including other commands that share a hook group with ours)
 4. Send a test notification to confirm it works
 
 After install, **restart any open Claude Code session** so it picks up the new hooks.
+
+**Upgrading from a version with the "waiting detector"?** Re-run the installer. It drops the old `PostToolUse` hook and narrows `PreToolUse` back to `AskUserQuestion|ExitPlanMode`. Those hooks ran a script on every Read/Edit/Write, and each `PreToolUse` hook blocks its tool call until the script exits. On a machine that shares `settings.json` with Windows, every file operation also started PowerShell there.
 
 If the test banner doesn't appear, open **System Settings → Notifications → terminal-notifier** and make sure it's allowed. Set its style to **Alerts** (instead of Banners) if you want notifications to stay on screen until you dismiss them, instead of disappearing on their own.
 
@@ -113,14 +115,14 @@ This removes the hook scripts, deletes the per-user `terminal-notifier` copy if 
 
 - **Hooks in `settings.json`** — Claude Code natively runs shell commands on lifecycle events. We attach to four, with portable `"$HOME/.claude/hooks/notify.sh"` commands so a synced `settings.json` works on every machine:
   - `Stop` — turn complete
-  - `Notification` — permission prompts and idle prompts
-  - `PreToolUse` for `Read`/`Edit`/`Write`/`MultiEdit`/`NotebookEdit` (arms the waiting-detector) plus `AskUserQuestion`/`ExitPlanMode` (banner immediately). Matched on those tool names so the hook doesn't run on every single tool call
-  - `PostToolUse` for the same read/edit tools — fires when one finishes, cancelling its waiting-detector
+  - `Notification` — idle prompts
+  - `PermissionRequest` — the "Allow …?" tool-approval prompt (the dedicated event; `AskUserQuestion`/`ExitPlanMode` also arrive here and are skipped as duplicates)
+  - `PreToolUse` matched on `AskUserQuestion|ExitPlanMode` only — in-chat questions and plan approval, with the question text. Keep this matcher narrow: every `PreToolUse` hook blocks its tool call until the script exits
 
   Note: at the user level Claude Code reads `~/.claude/settings.json` — **not** `settings.local.json` (that's a project-level file only). Global hooks placed in `settings.local.json` silently never fire.
 
   [Hook docs.](https://docs.claude.com/en/docs/claude-code/hooks)
-- **`notify.sh`** — receives the event JSON on stdin, extracts the message / question / plan and the project `cwd` (using `node`, falling back to `python3`), and renders the notification through `terminal-notifier`. The click action carries the base64-encoded `cwd`. Before notifying, it checks whether you're already focused on this project's VS Code window — frontmost app via `lsappinfo` (no permission), then the focused window's title via System Events (needs Accessibility, fails open) — and suppresses the banner if so. It also runs the **waiting-detector**: because the VS Code extension fires no hook when it shows a tool-permission prompt, `PreToolUse` drops a marker for the tool and a background watcher checks back a few seconds later; if `PostToolUse` hasn't cleared the marker, the tool is blocked on an "Allow…?" prompt and a banner is raised. Logs to `$TMPDIR/claude-banners.log`.
+- **`notify.sh`** — receives the event JSON on stdin, extracts the message / question / plan / permission detail and the project folder (`CLAUDE_PROJECT_DIR`, the session root, else the event `cwd`; using `node`, falling back to `python3`), and renders the notification through `terminal-notifier`. The click action carries the base64-encoded `cwd`. Before notifying, it checks whether you're already focused on this project's VS Code window — frontmost app via `lsappinfo` (no permission), then the focused window's title via System Events (needs Accessibility, fails open) — and suppresses the banner if so. Events it has no banner for are logged and ignored (they used to fall through to "Turn complete"). Logs to `$TMPDIR/claude-banners.log`.
 - **`focus-vscode.sh`** — invoked when the notification is clicked. Decodes the project folder and runs `code <folder>`, which asks VS Code to focus the matching window and come to the foreground — no Accessibility permission required. If the `code` CLI isn't found it falls back to activating VS Code and a best-effort AppleScript window raise. Logs to `$TMPDIR/claude-focus.log`.
 
 ### Why `terminal-notifier` and `-execute`?

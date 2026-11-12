@@ -2,25 +2,17 @@
 # Claude Code -> macOS notification bridge.
 #
 # Invoked by Claude Code hooks with the event name as $1:
-#   Stop / Notification / PreToolUse / PostToolUse
+#   Stop / Notification / PermissionRequest / PreToolUse
 # Reads the event JSON on stdin, renders native macOS notifications via
 # terminal-notifier, and wires the notification click to focus the right VS Code
 # window (via focus-vscode.sh).
 #
-# Why PreToolUse + PostToolUse: the VS Code extension does NOT fire any hook when
-# it shows a tool-permission prompt ("Allow reading from X?"). To still notify on
-# those, we run a small "waiting" detector — PreToolUse arms a marker per
-# tool_use_id and a background watcher; PostToolUse clears it. If a normally-instant
-# tool (Read/Edit/Write) hasn't completed within WAIT_SECS, it's blocked on a
-# permission prompt, so we show a banner. Tools that legitimately run long (Bash,
-# Grep, …) are NOT armed, to avoid false "needs approval" banners.
-#
-# A marker can ALSO go stale when a tool errors / is denied / is cancelled —
-# PostToolUse only fires for tools that actually complete, so those markers never
-# get cleared. We tell that apart from a genuine block with an activity heartbeat:
-# a real permission prompt freezes the session (nothing happens after the armed
-# tool), whereas a leaked marker is followed by more activity. Only the former
-# fires a banner.
+# Tool-permission prompts ("Allow reading from X?", "Allow running …?") arrive as
+# Claude Code's dedicated PermissionRequest event. Earlier versions guessed them
+# with a "waiting detector" (PreToolUse/PostToolUse hooks on every Read/Edit/
+# Write). That needed a hook on every file operation — and each PreToolUse hook
+# blocks its tool call — so it is gone. Stale PostToolUse or wide PreToolUse
+# entries left in an old settings.json are ignored cheaply.
 #
 # Logs to $TMPDIR/claude-banners.log. Never exits non-zero — a failed
 # notification must not break the Claude Code session.
@@ -31,25 +23,6 @@ EVENT="${1:-Stop}"
 
 LOG="${TMPDIR:-/tmp}/claude-banners.log"
 log() { printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$EVENT" "$*" >>"$LOG" 2>/dev/null || true; }
-
-# --- waiting-detector knobs ------------------------------------------------
-# One marker file per in-flight tool call lives here.
-PENDING_DIR="${TMPDIR:-/tmp}/claude-banners-pending"
-# Heartbeat touched on every hook event. The watcher compares it to a marker's
-# age: if anything happened AFTER the tool was armed, the session moved on (the
-# marker just leaked — tool errored/denied/cancelled, no PostToolUse), so we stay
-# quiet. Only a tool with no activity after it is genuinely blocked on YOU.
-ACTIVITY_FILE="${TMPDIR:-/tmp}/claude-banners.activity"
-# How long an armed tool may run before we assume it's blocked on a permission
-# prompt. Set well ABOVE how long these tools actually take to finish in practice
-# — including under heavy parallel workflows, where PostToolUse (which clears the
-# marker) can lag — so a slow-but-unblocked tool never false-fires. A real
-# permission prompt waits for you, far longer than this, so it still gets caught.
-WAIT_SECS=30
-# Tools whose runtime is always near-instant — a stall means "awaiting approval".
-# Bash/Grep/Glob/Task/WebFetch/WebSearch are deliberately omitted: they can run
-# long for legitimate reasons and would produce false alarms.
-ARMED_TOOLS="Read Edit Write MultiEdit NotebookEdit"
 
 FOCUS_SCRIPT="$HOME/.claude/hooks/focus-vscode.sh"
 
@@ -63,10 +36,11 @@ INPUT="$(cat 2>/dev/null || true)"
 jstr() { printf '%s' "$INPUT" | grep -oE "\"$1\":\"[^\"]*\"" | head -1 | sed -e "s/^\"$1\":\"//" -e 's/\"$//'; }
 
 # --- rich field extraction (node, python3 fallback) ------------------------
-# Only used for the question/plan/message paths (Notification, AskUserQuestion,
-# ExitPlanMode), never on the per-tool fast path — so the parser lookup lives
-# here, not at top level. Emits msg/question/plan/cwd as space-joined base64
-# tokens ("-" for empty) so positional `read` is safe.
+# Only used on the paths that show a banner (Notification, PermissionRequest,
+# AskUserQuestion, ExitPlanMode) — so the parser lookup lives here, not at top
+# level. Emits msg/question/plan/cwd/detail as space-joined base64 tokens ("-"
+# for empty) so positional `read` is safe. detail = what a PermissionRequest
+# wants to run: tool_input.description, else .command, else .file_path.
 extract() {
   local JSON_PARSER=""
   if command -v node >/dev/null 2>&1; then JSON_PARSER="node"
@@ -81,8 +55,9 @@ extract() {
           const q=(ti.questions&&ti.questions[0]&&ti.questions[0].question)||"";
           const plan=ti.plan?"1":"";
           const cwd=d.cwd||"";
+          const detail=ti.description||ti.command||ti.file_path||"";
           const enc=v=>{const b=Buffer.from(String(v),"utf8").toString("base64");return b||"-";};
-          process.stdout.write([msg,q,plan,cwd].map(enc).join(" "));
+          process.stdout.write([msg,q,plan,cwd,detail].map(enc).join(" "));
         });' 2>/dev/null
       ;;
     python3)
@@ -96,12 +71,13 @@ qs=ti.get("questions") or []
 q=(qs[0].get("question") if qs and isinstance(qs[0],dict) else "") or ""
 plan="1" if ti.get("plan") else ""
 cwd=d.get("cwd") or ""
+detail=ti.get("description") or ti.get("command") or ti.get("file_path") or ""
 def enc(v):
     b=base64.b64encode(str(v).encode("utf-8")).decode("ascii")
     return b if b else "-"
-sys.stdout.write(" ".join(enc(x) for x in [msg,q,plan,cwd]))' 2>/dev/null
+sys.stdout.write(" ".join(enc(x) for x in [msg,q,plan,cwd,detail]))' 2>/dev/null
       ;;
-    *) printf -- '- - - -' ;;
+    *) printf -- '- - - - -' ;;
   esac
 }
 dec() { [ "${1:-}" = "-" ] && return 0; printf '%s' "$1" | base64 -d 2>/dev/null || true; }
@@ -174,8 +150,11 @@ is_focused_on_this_project() {
 # Render one notification. Resolves cwd -> project root, suppresses if you're
 # already on that window, and wires the click to focus it.
 #   show_banner <subtitle> <body> <raw-cwd>
+# CLAUDE_PROJECT_DIR (the session's root folder, set by Claude Code for hooks)
+# wins over the payload cwd: cwd follows every `cd` the session makes, so it can
+# point into a subfolder that is not a git repo or VS Code window of its own.
 show_banner() {
-  local subtitle="$1" body="${2:- }" rawcwd="${3:-}"
+  local subtitle="$1" body="${2:- }" rawcwd="${CLAUDE_PROJECT_DIR:-${3:-}}"
   local cwd leaf
   cwd="$(resolve_project_root "$rawcwd")"
   leaf=""; [ -n "$cwd" ] && leaf="$(basename "$cwd" 2>/dev/null || true)"
@@ -198,70 +177,57 @@ show_banner() {
 }
 
 # --- dispatch --------------------------------------------------------------
-# Mark that the session is alive/progressing (used by the watcher below).
-touch "$ACTIVITY_FILE" 2>/dev/null || true
 case "$EVENT" in
   PreToolUse)
-    # Fires before EVERY tool call. Keep the common path cheap (grep, no node).
+    # Matched on AskUserQuestion|ExitPlanMode by install.sh. Anything else comes
+    # from a stale, wider matcher in an old settings.json — ignore it (cheap path:
+    # grep only, no node).
     tool_name="$(jstr tool_name)"
     case "$tool_name" in
       AskUserQuestion|ExitPlanMode)
-        # Always a prompt for you -> banner immediately (these don't come through
-        # the Notification event in current Claude Code).
-        T_MSG="-"; T_Q="-"; T_PLAN="-"; T_CWD="-"
-        read -r T_MSG T_Q T_PLAN T_CWD < <(extract) || true
+        # Always a prompt for you -> banner immediately, with the question text.
+        T_MSG="-"; T_Q="-"; T_PLAN="-"; T_CWD="-"; T_DETAIL="-"
+        read -r T_MSG T_Q T_PLAN T_CWD T_DETAIL < <(extract) || true
         Q="$(dec "$T_Q")"; PLAN="$(dec "$T_PLAN")"; CWD="$(dec "$T_CWD")"
         if [ -n "$Q" ]; then BODY="$Q"
         elif [ -n "$PLAN" ]; then BODY="Claude is proposing a plan — your approval is needed"
         else BODY="Waiting for your input in VS Code"; fi
         show_banner "Needs your attention" "$BODY" "$CWD"
         ;;
-      Read|Edit|Write|MultiEdit|NotebookEdit)
-        # Arm the waiting detector: if PostToolUse doesn't clear this within
-        # WAIT_SECS, the tool is blocked on a permission prompt.
-        tuid="$(jstr tool_use_id)"; [ -n "$tuid" ] || exit 0
-        cwd="$(jstr cwd)"
-        mkdir -p "$PENDING_DIR" 2>/dev/null || true
-        marker="$PENDING_DIR/$tuid"
-        printf '%s\n' "$cwd" >"$marker" 2>/dev/null || true
-        # Detached watcher — the hook itself returns immediately.
-        ( sleep "$WAIT_SECS"
-          # Fire only if the marker survived AND nothing happened after it was
-          # armed. Activity afterwards ⇒ the tool didn't block you — its marker
-          # just leaked (errored/denied/cancelled, no PostToolUse) — so stay quiet.
-          if [ -e "$marker" ]; then
-            if [ "$ACTIVITY_FILE" -nt "$marker" ]; then
-              log "suppressed: '$tool_name' marker leaked (no PostToolUse; session moved on) — not a prompt"
-            else
-              show_banner "Needs your approval" "$tool_name is waiting for your permission" "$(cat "$marker" 2>/dev/null || true)"
-            fi
-          fi
-          rm -f "$marker" 2>/dev/null || true
-        ) </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-        ;;
-      *) : ;;  # Bash/Grep/Glob/Task/Web… — not armed, no banner
+      *) : ;;
     esac
     exit 0
     ;;
+  PermissionRequest)
+    # The "Allow …?" tool-approval prompt. AskUserQuestion/ExitPlanMode also
+    # arrive here, but PreToolUse already showed them with the question text.
+    tool_name="$(jstr tool_name)"
+    case "$tool_name" in
+      AskUserQuestion|ExitPlanMode)
+        log "skipped: PermissionRequest for $tool_name (PreToolUse already notified)"
+        exit 0 ;;
+    esac
+    T_MSG="-"; T_Q="-"; T_PLAN="-"; T_CWD="-"; T_DETAIL="-"
+    read -r T_MSG T_Q T_PLAN T_CWD T_DETAIL < <(extract) || true
+    CWD="$(dec "$T_CWD")"; DETAIL="$(dec "$T_DETAIL")"
+    if [ -n "$DETAIL" ]; then BODY="${tool_name:-Tool}: $DETAIL"
+    else BODY="${tool_name:-A tool} is waiting for your permission"; fi
+    show_banner "Needs your approval" "$BODY" "$CWD"
+    ;;
   PostToolUse)
-    # Tool finished (or was approved) -> cancel its pending watcher. If it took
-    # unusually long to clear (but was never a prompt), note it so the WAIT_SECS
-    # margin can be sanity-checked against real-world latency.
-    tuid="$(jstr tool_use_id)"
-    if [ -n "$tuid" ]; then
-      marker="$PENDING_DIR/$tuid"
-      if [ -e "$marker" ]; then
-        age=$(( $(date +%s) - $(stat -f %m "$marker" 2>/dev/null || date +%s) ))
-        [ "$age" -ge 5 ] && log "armed tool cleared after ${age}s (not a prompt; WAIT_SECS=$WAIT_SECS)"
-        rm -f "$marker" 2>/dev/null || true
-      fi
-    fi
+    # No longer used (the old waiting detector); ignore stale hook entries.
     exit 0
     ;;
   Notification)
-    T_MSG="-"; T_Q="-"; T_PLAN="-"; T_CWD="-"
-    read -r T_MSG T_Q T_PLAN T_CWD < <(extract) || true
+    # permission_prompt only repeats a prompt PermissionRequest / PreToolUse has
+    # already shown, 15-30 s later — often after you answered. Skip it; other
+    # types (idle_prompt, ...) still notify.
+    if [ "$(jstr notification_type)" = "permission_prompt" ]; then
+      log "skipped: notification_type=permission_prompt (PermissionRequest/PreToolUse already notified)"
+      exit 0
+    fi
+    T_MSG="-"; T_Q="-"; T_PLAN="-"; T_CWD="-"; T_DETAIL="-"
+    read -r T_MSG T_Q T_PLAN T_CWD T_DETAIL < <(extract) || true
     MSG="$(dec "$T_MSG")"; Q="$(dec "$T_Q")"; PLAN="$(dec "$T_PLAN")"; CWD="$(dec "$T_CWD")"
     if [ -n "$MSG" ]; then BODY="$MSG"
     elif [ -n "$Q" ]; then BODY="$Q"
@@ -269,9 +235,14 @@ case "$EVENT" in
     else BODY="Waiting for your input in VS Code"; fi
     show_banner "Needs your attention" "$BODY" "$CWD"
     ;;
-  *)  # Stop (turn complete)
+  Stop)
     CWD="$(jstr cwd)"
     show_banner "Turn complete" "Ready for your next prompt" "$CWD"
+    ;;
+  *)
+    # Unknown events used to fall through to "Turn complete" — e.g. every
+    # PermissionRequest showed a false "Turn complete" banner.
+    log "skipped: no banner for event '$EVENT'"
     ;;
 esac
 
